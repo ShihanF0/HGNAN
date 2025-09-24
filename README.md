@@ -12,4 +12,3 @@ If you have a specific set of hyperparameters, run with
 bash run_one_experiment.sh
 ```
 
-Processed datasets and saved models could be found [here](https://drive.google.com/drive/folders/1Tii_EdlOwq1BprRIjV8I4Q5zXXVFHM9U?usp=drive_link). Please download them and move them into "processed_data" or "models" if needed.
