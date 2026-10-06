@@ -1,33 +1,25 @@
+import torch
 import torch.nn as nn
-import torch_geometric as pyg
 import torch.nn.functional as F
-import numpy as np
-from utils import *
+import torch.utils.checkpoint as cp
+
+
+def mlp(d_in, d_hid, d_out, n_layers, bias, dropout=None):
+    if n_layers == 1:
+        return [nn.Linear(d_in, d_out, bias=bias)]
+    layers = []
+    for i in range(n_layers - 1):
+        layers += [nn.Linear(d_in if i == 0 else d_hid, d_hid, bias=bias), nn.ReLU()]
+        if dropout is not None:
+            layers.append(nn.Dropout(p=dropout))
+    layers.append(nn.Linear(d_hid, d_out, bias=bias))
+    return layers
+
 
 class HGNAN(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        num_layers,
-        hidden_channels=None,
-        bias=True,
-        dropout=0.0,
-        device='cuda',
-        limited_m=True,
-        normalize_m=True,
-        m_per_feature=False,
-        weight = True,
-        num_s_values=1,
-        aggregation = "overall",
-
-        edge_temp=1.0, # GAT temp
-        attn_dropout=0.2, # attention dropout
-        use_soft_threshold=True, # soft-shrink or not
-        soft_threshold_lambda=0.015, # soft-shrink threshold
-        lambda_l1=1e-4, # L1 coefficient
-    ):
-        
+    def __init__(self, in_channels, out_channels, num_layers, hidden_channels, bias=True, dropout=0.0,
+                 device='cuda', normalize=True, weight=True, num_s=1, aggregation='overall',
+                 attn_hidden=64, attn_dropout=0.2, lam=0.015, budget=1 << 31):
         super().__init__()
         self.device = device
         self.in_channels = in_channels
@@ -36,199 +28,173 @@ class HGNAN(nn.Module):
         self.hidden_channels = hidden_channels
         self.bias = bias
         self.dropout = dropout
-        self.limited_m = limited_m
-        self.normalize_m = normalize_m
-        self.m_per_feature = m_per_feature
+        self.normalize = normalize
         self.weight = weight
         self.aggregation = aggregation
-        if self.weight == True:
-            self.feature_weights = nn.Parameter(torch.rand(self.in_channels))
-        # Create weight for different s_values
-        self.s_weights = nn.Parameter(torch.ones(num_s_values))
+        self.budget = budget
+        self._shell = {}
+        self._edges = {}
 
-        if self.aggregation == "neighbor":
-            self.use_soft_threshold = use_soft_threshold
-            self.soft_threshold_lambda = soft_threshold_lambda
-            self.lambda_l1 = lambda_l1
-            self.mix_logit = nn.Parameter(torch.tensor(2.0))
+        if weight:
+            self.feature_weights = nn.Parameter(torch.rand(in_channels))
+        self.s_weights = nn.Parameter(torch.ones(num_s))
 
-            self.edge_temp = edge_temp
+        if aggregation == 'neighbor':
+            self.lam = lam
             self.attn_dropout = attn_dropout
+            self.mix_logit = nn.Parameter(torch.tensor(2.0))
             self.leaky_relu = nn.LeakyReLU(0.2)
-            self.gamma_logit = nn.Parameter(torch.tensor(-2.0, device=self.device))
-            self.reg_l1_alpha = torch.tensor(0.0, device=self.device)
             self.bias_same = nn.Parameter(torch.tensor(0.0))
             self.bias_near = nn.Parameter(torch.tensor(0.0))
-            
             self.attn_mlp = nn.Sequential(
-                nn.Linear(4 * self.out_channels, getattr(self, "attn_hidden", 64), bias=True),
+                nn.Linear(4 * out_channels, attn_hidden),
                 nn.ELU(),
-                nn.Dropout(p=self.attn_dropout),
-                nn.Linear(getattr(self, "attn_hidden", 64), 1, bias=True)
+                nn.Dropout(p=attn_dropout),
+                nn.Linear(attn_hidden, 1),
             )
             with torch.no_grad():
                 nn.init.zeros_(self.attn_mlp[-1].weight)
                 nn.init.zeros_(self.attn_mlp[-1].bias)
 
-        # shape functions f_k
-        self.fs = nn.ModuleList()
-        for _ in range(in_channels):
-            if num_layers == 1:
-                layers = [nn.Linear(1, out_channels, bias=bias)]
-            else:
-                layers = [nn.Linear(1, hidden_channels, bias=bias), nn.ReLU(), nn.Dropout(p=dropout)]
-                for _ in range(1, num_layers - 1):
-                    layers += [nn.Linear(hidden_channels, hidden_channels, bias=bias), nn.ReLU(), nn.Dropout(p=dropout)]
-                layers.append(nn.Linear(hidden_channels, out_channels, bias=bias))
-            self.fs.append(nn.Sequential(*layers))
+        self.fs = nn.ModuleList(
+            nn.Sequential(*mlp(1, hidden_channels, out_channels, num_layers, bias, dropout))
+            for _ in range(in_channels))
+        self.m = nn.Sequential(*mlp(1, hidden_channels, 1, num_layers, bias))
 
-        # distance functions \rho
-        if m_per_feature:
-            self.ms = nn.ModuleList()
-            for _ in range(out_channels if limited_m else in_channels):
-                if num_layers == 1:
-                    m_layers = [nn.Linear(1, out_channels, bias=bias)]
+    def _fs(self, x, lo, hi):
+        h = x[:, lo:hi].t().unsqueeze(-1)
+        for i, layer in enumerate(self.fs[0]):
+            if isinstance(layer, nn.Linear):
+                W = torch.stack([self.fs[k][i].weight for k in range(lo, hi)]).transpose(1, 2)
+                if layer.bias is not None:
+                    b = torch.stack([self.fs[k][i].bias for k in range(lo, hi)]).unsqueeze(1)
+                    h = torch.baddbmm(b, h, W)
                 else:
-                    m_layers = [nn.Linear(1, hidden_channels, bias=bias), nn.ReLU()]
-                    for _ in range(1, num_layers - 1):
-                        m_layers += [nn.Linear(hidden_channels, hidden_channels, bias=bias), nn.ReLU()]
-                    if limited_m:
-                        m_layers.append(nn.Linear(hidden_channels, 1, bias=bias))
-                    else:
-                        m_layers.append(nn.Linear(hidden_channels, out_channels, bias=bias))
-                self.ms.append(nn.Sequential(*m_layers))
-        else:
-            if num_layers == 1:
-                m_layers = [nn.Linear(1, out_channels, bias=bias)]
+                    h = torch.bmm(h, W)
+            elif isinstance(layer, nn.ReLU):
+                h = torch.relu(h)
+            elif isinstance(layer, nn.Dropout):
+                h = F.dropout(h, p=layer.p, training=self.training)
+        return h
+
+    def _chunk(self, x):
+        per = 4 * x.size(0) * (self.hidden_channels or self.out_channels) * max(self.num_layers, 1)
+        return max(1, min(x.size(1), int(self.budget / max(per, 1))))
+
+    def phi(self, x):
+        w = F.softmax(self.feature_weights, dim=0) if self.weight else None
+        p = x.size(1)
+        chunk = self._chunk(x)
+        ckpt = self.training and torch.is_grad_enabled() and chunk < p
+
+        def block(lo, hi):
+            fx = self._fs(x, lo, hi)
+            return (fx * w[lo:hi].view(-1, 1, 1)).sum(0) if w is not None else fx.sum(0)
+
+        out = None
+        for a in range(0, p, chunk):
+            b = min(p, a + chunk)
+            s = cp.checkpoint(block, a, b, use_reentrant=False) if ckpt else block(a, b)
+            out = s if out is None else out + s
+        return out
+
+    def _shells(self, key, dist, norm):
+        if key not in self._shell:
+            uniq, idx = torch.unique(dist.detach().to('cpu'), return_inverse=True)
+            self._shell[key] = (uniq.view(-1, 1).to(self.device), idx.to(self.device),
+                                norm.to(self.device) if self.normalize else None)
+        return self._shell[key]
+
+    def overall(self, h, dist, norm, key):
+        uniq, idx, norm = self._shells(key, dist, norm)
+        W = self.m(uniq).squeeze(-1)[idx]
+        if norm is not None:
+            W = W / norm
+        return W @ h
+
+    def _nbrs(self, key, dist):
+        if key not in self._edges:
+            d = dist.detach().to('cpu')
+            hops = torch.where(d > 0, 1.0 / d.clamp(min=1e-12) - 1.0, torch.full_like(d, float('inf'))).round()
+            nb = (hops >= 1) & (hops <= 2)
+            nb.fill_diagonal_(False)
+            e = nb.nonzero(as_tuple=False)
+            self._edges[key] = None if e.numel() == 0 else (
+                e[:, 0].to(self.device), e[:, 1].to(self.device), (hops == 1)[e[:, 0], e[:, 1]].to(self.device))
+        return self._edges[key]
+
+    def neighbor(self, h, dist, key):
+        edges = self._nbrs(key, dist)
+        if edges is None:
+            return h
+        i, j, same = edges
+        N = h.size(0)
+
+        hi, hj = h[i], h[j]
+        logits = self.attn_mlp(torch.cat([hi, hj, (hi - hj).abs(), hi * hj], dim=1)).squeeze(-1)
+        logits = logits + torch.where(same, self.bias_same, self.bias_near)
+        e = self.leaky_relu(logits)
+
+        sum_e = torch.zeros(N, device=h.device).index_add(0, i, e)
+        cnt = torch.zeros(N, device=h.device).index_add(0, i, torch.ones_like(e))
+        e = e - (sum_e / cnt.clamp_min(1.0)).index_select(0, i)
+        exp_e = torch.exp(e.clamp(max=10.0))
+        denom = torch.zeros(N, device=h.device)
+        denom.index_add_(0, i, exp_e)
+        alpha = exp_e / (denom.index_select(0, i) + 1e-12)
+        if self.attn_dropout > 0.0 and self.training:
+            alpha = F.dropout(alpha, p=self.attn_dropout, training=True)
+
+        alpha = F.softshrink(alpha, lambd=self.lam).clamp_min(0.0)
+        rs = torch.zeros(N, device=h.device).index_add(0, i, alpha)
+        ok = rs.index_select(0, i) > 0
+        a_ij = torch.zeros_like(alpha)
+        a_ij[ok] = alpha[ok] / (rs.index_select(0, i)[ok] + 1e-12)
+
+        agg = torch.zeros_like(h)
+        agg.index_add_(0, i, a_ij.unsqueeze(1) * h[j])
+        a = torch.sigmoid(self.mix_logit)
+        return a * h + (1.0 - a) * agg
+
+    def agg(self, h, data):
+        outs = []
+        for key in sorted(data.dist_mats.keys(), key=lambda k: int(k[1:])):
+            if self.aggregation == 'overall':
+                outs.append(self.overall(h, data.dist_mats[key], data.norm_mats[key], key))
             else:
-                m_layers = [nn.Linear(1, hidden_channels, bias=bias), nn.ReLU()]
-                for _ in range(1, num_layers - 1):
-                    m_layers += [nn.Linear(hidden_channels, hidden_channels, bias=bias), nn.ReLU()]
-                if limited_m:
-                    m_layers.append(nn.Linear(hidden_channels, 1, bias=bias))
-                else:
-                    m_layers.append(nn.Linear(hidden_channels, out_channels, bias=bias))
-            self.m = nn.Sequential(*m_layers)
+                outs.append(self.neighbor(h, data.dist_mats[key], key))
+        beta = F.softmax(self.s_weights, dim=0).view(-1, 1, 1)
+        return (torch.stack(outs, dim=0) * beta).sum(0)
 
-    def _calculate_aggregation(self, f_sums, distances, normalization_matrix):
-        if self.aggregation == "overall":
-            m_dist = self.m(distances.flatten().view(-1, 1))
-            m_dist = m_dist.view(distances.size(0), distances.size(1), self.out_channels)
+    def forward(self, data):
+        return self.agg(self.phi(data.x.to(self.device)), data)
 
-            if self.normalize_m:
-                m_dist = m_dist / normalization_matrix.unsqueeze(-1)
 
-            output = torch.sum(m_dist * f_sums.unsqueeze(0), dim=1)
+ABLATIONS = ('none', 'no_agg', 'no_additive', 'no_features')
 
-        elif self.aggregation == "neighbor":
-            N, D = f_sums.size()
-            h = f_sums                                         # (N, D)
 
-            neighbor_mask = torch.isin(distances, torch.tensor([1.0, 0.5], device=distances.device))
-            neighbor_mask.fill_diagonal_(False)
-            edges = neighbor_mask.nonzero(as_tuple=False)      # (E, 2)
-            if edges.numel() == 0:
-                return h
+class Ablation(HGNAN):
+    def __init__(self, *args, ablation='none', **kwargs):
+        if ablation == 'no_features':
+            kwargs['aggregation'] = 'overall'
+        super().__init__(*args, **kwargs)
+        self.ablation = ablation
+        if ablation == 'no_additive':
+            self.encoder = nn.Sequential(*mlp(
+                self.in_channels, self.hidden_channels or self.out_channels, self.out_channels,
+                self.num_layers, self.bias, self.dropout)).to(self.device)
+            del self.fs
+        elif ablation == 'no_features':
+            self.const = nn.Parameter(torch.randn(1, self.out_channels))
+            del self.fs
 
-            i = edges[:, 0]  # target indices (E,)
-            j = edges[:, 1]  # source indices (E,)
+    def phi(self, x):
+        if self.ablation == 'no_additive':
+            return self.encoder(x)
+        if self.ablation == 'no_features':
+            return self.const.expand(x.size(0), -1).to(self.device)
+        return super().phi(x)
 
-            # GAT-style weight
-            hi, hj = h[i], h[j]
-            pair = torch.cat([hi, hj, (hi - hj).abs(), (hi * hj)], dim=1)
-
-            # logits
-            logits = self.attn_mlp(pair).squeeze(-1) 
-            is_same = (distances[i, j] == 1.0)
-            logits = logits + torch.where(is_same, self.bias_same, self.bias_near)
-            e = self.leaky_relu((logits) / max(self.edge_temp, 1e-12))
-
-            # softmax within each neighbors
-            sum_e = torch.zeros(N, device=h.device).index_add(0, i, e)
-            cnt_e = torch.zeros(N, device=h.device).index_add(0, i, torch.ones_like(e))
-            mean_e = sum_e / cnt_e.clamp_min(1.0)
-            e_shift = e - mean_e.index_select(0, i)
-
-            exp_e = torch.exp(e_shift.clamp(max=10.0))
-            denom = torch.zeros(N, device=h.device)
-            denom.index_add_(0, i, exp_e)
-            alpha = exp_e / (denom.index_select(0, i) + 1e-12) # (E,)
-
-            if self.attn_dropout > 0.0 and self.training:
-                alpha = F.dropout(alpha, p=self.attn_dropout, training=True)
-
-            # soft-threshold
-            if self.use_soft_threshold and self.soft_threshold_lambda > 0:
-                alpha_shrunk = F.softshrink(alpha, lambd=self.soft_threshold_lambda).clamp_min(0.0)
-            else:
-                alpha_shrunk = alpha
-
-            sum_per_row = torch.zeros(N, device=h.device).index_add(0, i, alpha_shrunk)
-            deg_row = torch.zeros(N, device=h.device).index_add(0, i, torch.ones_like(alpha_shrunk))
-            l1_per_row = (sum_per_row / deg_row.clamp_min(1.0)).mean()
-            self.reg_l1_alpha = self.lambda_l1 * l1_per_row
-
-            denom2 = sum_per_row
-            safe_edge = denom2.index_select(0, i) > 0
-            alpha_final = torch.zeros_like(alpha_shrunk)
-            alpha_final[safe_edge] = alpha_shrunk[safe_edge] / (denom2.index_select(0, i)[safe_edge] + 1e-12)
-
-            agg = torch.zeros_like(h)
-            agg.index_add_(0, i, alpha_final.unsqueeze(1) * h[j])  # (N, D)
-
-            a = torch.sigmoid(self.mix_logit)
-            output = a * h + (1.0 - a) * agg
-
-            with torch.no_grad():
-                avg_neighbors = neighbor_mask.sum(dim=1).float().mean()
-                kept_per_row = torch.zeros(N, device=h.device).index_add(0, i, (alpha_final > 0).float())
-                self.avg_neighbors_no_cutoff = float(avg_neighbors.item())
-                self.avg_neighbors_after_cutoff = float((kept_per_row.mean()).item())
-                print(f"[HGNAN] avg neighbors (no cutoff): {self.avg_neighbors_no_cutoff:.3f} | "
-                      f"avg neighbors after shrink: {self.avg_neighbors_after_cutoff:.3f} ")
-        else:
-            raise ValueError("Unknown aggregation type: {}".format(self.aggregation))
-        return output
-    
-    def forward(self, inputs):
-        x = inputs.x.to(self.device)
-        fx = torch.empty(x.size(0), x.size(1), self.out_channels).to(self.device)
-        for feature_index in range(x.size(1)):
-            feature_col = x[:, feature_index].view(-1, 1)
-            fx[:, feature_index] = self.fs[feature_index](feature_col)
-        if self.weight == True:
-            attention_weights = F.softmax(torch.exp(self.feature_weights), dim=0)
-            fx_weighted = fx * attention_weights.unsqueeze(0).unsqueeze(-1)  # (N, num_features, out_channels)
-            f_sums = fx_weighted.sum(dim=1)
-        else:
-            f_sums = fx.sum(dim=1)
-
-        # Loop to deal with all matrixs of s_values
-        s_outputs = []
-        sorted_s_keys = sorted(inputs.dist_mats.keys(), key=lambda k: int(k[1:]))
-
-        for s_key in sorted_s_keys:
-            distances = inputs.dist_mats[s_key].to(self.device)
-            norm_mat = inputs.norm_mats[s_key].to(self.device)
-            s_output = self._calculate_aggregation(f_sums, distances, norm_mat)
-            s_outputs.append(s_output)
-        
-        s_weights_normalized = F.softmax(self.s_weights, dim=0)
-        stacked_outputs = torch.stack(s_outputs, dim=0)
-        weights_reshaped = s_weights_normalized.view(-1, 1, 1)
-        final_output = torch.sum(stacked_outputs * weights_reshaped, dim=0)
-
-        return final_output
-
-    def print_m_params(self):
-        if hasattr(self, 'm'):
-            print("Single m network parameters:")
-            for name, param in self.m.named_parameters():
-                print(name, param)
-        elif hasattr(self, 'ms'):
-            print("Separate m networks per dimension:")
-            for idx, module in enumerate(self.ms):
-                for name, param in module.named_parameters():
-                    print(f"ms[{idx}].{name}", param)
-        else:
-            print("No m parameters found.")
+    def forward(self, data):
+        h = self.phi(data.x.to(self.device))
+        return h if self.ablation == 'no_agg' else self.agg(h, data)
