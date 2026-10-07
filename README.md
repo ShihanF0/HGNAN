@@ -8,7 +8,6 @@ This repository contains the training code for **Interpretable Learning on Highe
   - `node`: HGNAN-node for node classification on hypergraphs.
   - `edge`: HGNAN-edge for hyperedge prediction, used to recover missing reactions in genome-scale metabolic models (GEMs).
 - Two structural aggregations: `overall` (learned weights over distance shells) and `neighbor` (sparse attention over one- and two-hop neighbors).
-- Leak-free GEM benchmark: the reference graph is built from the training positives only.
 - Ablations: `no_agg`, `no_additive`, and `no_features`.
 - Supported datasets: Zoo, Mushroom, NTU2012, Cora, Pokec, Actor (node); iAF1260b, iJR904, iSB619, iYO844 (edge).
 
